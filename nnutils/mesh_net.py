@@ -234,6 +234,7 @@ class MeshNet(nn.Module):
 
         if self.symmetric:
             verts, faces, num_indept, num_sym, num_indept_faces, num_sym_faces = mesh.make_symmetric(verts, faces)
+            verts_uv = mesh.get_spherical_coords(verts)
             if sfm_mean_shape is not None:
                 verts = geom_utils.project_verts_on_mesh(verts, sfm_mean_shape[0], sfm_mean_shape[1])
 
@@ -249,6 +250,7 @@ class MeshNet(nn.Module):
             self.num_sym_faces = num_sym_faces
             # mean shape is only half.
             self.mean_v = nn.Parameter(torch.Tensor(verts[:num_sym_output]))
+            self.mean_v_uv = torch.Tensor(verts_uv[:num_sym_output])
 
             # Needed for symmetrizing..
             self.flip = Variable(torch.ones(1, 3).cuda(), requires_grad=False)
@@ -257,6 +259,7 @@ class MeshNet(nn.Module):
             if sfm_mean_shape is not None:
                 verts = geom_utils.project_verts_on_mesh(verts, sfm_mean_shape[0], sfm_mean_shape[1])            
             self.mean_v = nn.Parameter(torch.Tensor(verts))
+            self.mean_v_uv = torch.Tensor(verts)
             self.num_output = num_verts
 
         verts_np = verts
@@ -319,3 +322,21 @@ class MeshNet(nn.Module):
 
     def get_mean_shape(self):
         return self.symmetrize(self.mean_v)
+
+    def get_mean_shape_uv(self):
+        if self.symmetric:
+            # need to flip x -> -x. 
+            # Change phi -> pi-phi
+            # Change u-> 1-u
+            # Reference: 
+            #   theta = (v+1)/2 * pi
+            #   phi   = u * pi
+            #   x = torch.sin(theta)*torch.cos(phi)
+            uv_left = self.mean_v_uv[-self.num_sym:]
+            v_left = uv_left[:,1]
+            u_left = 1 - uv_left[:,0]   # [0,2]
+            u_left[u_left>1] += -2      # [-1,1]
+            uv_left = torch.stack([u_left,v_left],1)
+            return torch.cat([self.mean_v_uv, uv_left], 0)
+        else:
+            return self.mean_v_uv

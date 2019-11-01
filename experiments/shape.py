@@ -70,6 +70,9 @@ class ShapeTrainer(train_utils.Trainer):
 
         if opts.num_pretrain_epochs > 0:
             self.load_network(self.model, 'pred', opts.num_pretrain_epochs)
+        
+        if not opts.is_train:
+            self.model.eval()
 
         self.model = self.model.cuda(device=opts.gpu_id)
 
@@ -130,6 +133,7 @@ class ShapeTrainer(train_utils.Trainer):
         mask_tensor = batch['mask'].type(torch.FloatTensor)
         kp_tensor = batch['kp'].type(torch.FloatTensor)
         cam_tensor = batch['sfm_pose'].type(torch.FloatTensor)
+        self.frame_id = batch['inds'].type(torch.LongTensor)
 
         self.input_imgs = Variable(
             input_img_tensor.cuda(device=opts.gpu_id), requires_grad=False)
@@ -201,6 +205,8 @@ class ShapeTrainer(train_utils.Trainer):
         if opts.texture:
             self.tex_loss = self.texture_loss(self.texture_pred, self.imgs, self.mask_pred, self.masks)
             self.tex_dt_loss = self.texture_dt_loss_fn(self.texture_flow, self.dts_barrier)
+        else:
+            self.tex_dt_loss = torch.zeros_like(self.cam_loss)
 
         # Priors:
         self.vert2kp_loss = self.entropy_loss(self.vert2kp)
@@ -254,6 +260,11 @@ class ShapeTrainer(train_utils.Trainer):
             rend_top = self.vis_rend.diff_vp(self.pred_v[i], self.cam_pred[i], axis=[0, 1, 0], texture=texture_here, kp_verts=self.kp_verts[i])
             diff_rends = np.hstack((rend_frontal, rend_top))
 
+            # Render GT view from front & back:
+            rend_frontal = self.vis_rend.diff_vp(self.pred_v[i], self.cams[i], texture=texture_here, kp_verts=self.kp_verts[i])
+            rend_top = self.vis_rend.diff_vp(self.pred_v[i], self.cams[i], axis=[0, 1, 0], texture=texture_here, kp_verts=self.kp_verts[i])
+            diff_rends_gt = np.hstack((rend_frontal, rend_top))
+
             if self.opts.texture:
                 uv_img = bird_vis.tensor2im(uv_images[i].data)
                 show_uv_imgs.append(uv_img)
@@ -266,9 +277,11 @@ class ShapeTrainer(train_utils.Trainer):
                 imgs = np.hstack((input_img, pred_kp_img))
 
             rend_gtcam = self.vis_rend(self.pred_v[i], self.cams[i], texture=texture_here)
-            rends = np.hstack((diff_rends, rend_predcam, rend_gtcam))
-            vis_dict['%d' % i] = np.hstack((imgs, rends, masks))
-            vis_dict['masked_img %d' % i] = bird_vis.tensor2im((self.imgs[i] * self.masks[i]).data)
+            rends_gt = np.hstack((rend_gtcam, diff_rends_gt, np.zeros(rend_predcam.shape, dtype=diff_rends_gt.dtype)))
+            rends = np.hstack((rend_predcam, diff_rends, np.zeros(rend_predcam.shape, dtype=diff_rends_gt.dtype)))
+            hh = np.hstack((imgs, masks))
+            vis_dict['%d' % i] = np.vstack((hh, rends_gt, rends))
+            vis_dict['masked_img_%d' % i] = bird_vis.tensor2im((self.imgs[i] * self.masks[i]).data)
 
         if self.opts.texture:
             vis_dict['uv_images'] = np.hstack(show_uv_imgs)

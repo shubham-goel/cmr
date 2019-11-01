@@ -13,6 +13,7 @@ import pdb
 from absl import flags
 
 from ..utils.visualizer import Visualizer
+from ..utils.tb_visualizer import TBVisualizer
 
 #-------------- flags -------------#
 #----------------------------------#
@@ -21,7 +22,7 @@ curr_path = osp.dirname(osp.abspath(__file__))
 cache_path = osp.join(curr_path, '..', 'cachedir')
 
 flags.DEFINE_string('name', 'exp_name', 'Experiment Name')
-# flags.DEFINE_string('cache_dir', cache_path, 'Cachedir') # Not used!
+flags.DEFINE_string('cache_dir', cache_path, 'Cachedir') # Not used!
 flags.DEFINE_integer('gpu_id', 0, 'Which gpu to use')
 flags.DEFINE_integer('num_epochs', 1000, 'Number of epochs to train')
 flags.DEFINE_integer('num_pretrain_epochs', 0, 'If >0, we will pretain from an existing saved model.')
@@ -83,7 +84,7 @@ class Trainer():
         if network_dir is None:
             network_dir = self.save_dir
         save_path = os.path.join(network_dir, save_filename)
-        network.load_state_dict(torch.load(save_path))
+        network.load_state_dict(torch.load(save_path), strict=False)
         return
 
     def define_model(self):
@@ -140,6 +141,10 @@ class Trainer():
         self.smoothed_total_loss = 0
         self.visualizer = Visualizer(opts)
         visualizer = self.visualizer
+
+        self.tb_visualizer = TBVisualizer(opts)
+        tb_visualizer = self.tb_visualizer
+
         total_steps = 0
         dataset_size = len(self.dataloader)
 
@@ -152,9 +157,10 @@ class Trainer():
                     self.optimizer.zero_grad()
                     self.forward()
                     self.smoothed_total_loss = self.smoothed_total_loss*0.99 + 0.01*self.total_loss.data[0]
-                    self.total_loss.backward()
-                    # pdb.set_trace()
-                    self.optimizer.step()
+                    if opts.is_train:
+                        self.total_loss.backward()
+                        # pdb.set_trace()
+                        self.optimizer.step()
 
                 total_steps += 1
                 epoch_iter += 1
@@ -162,8 +168,9 @@ class Trainer():
                 if opts.display_visuals and (total_steps % opts.display_freq == 0):
                     iter_end_time = time.time()
                     print('time/itr %.2g' % ((iter_end_time - iter_start_time)/opts.display_freq))
-                    visualizer.display_current_results(self.get_current_visuals(), epoch)
-                    visualizer.plot_current_points(self.get_current_points())
+                    # visualizer.display_current_results(self.get_current_visuals(), epoch)
+                    tb_visualizer.display_current_results({'img':self.get_current_visuals()}, total_steps)
+                    # tb_visualizer.plot_current_points(self.get_current_points())
 
                 if opts.print_scalars and (total_steps % opts.print_freq == 0):
                     scalars = self.get_current_scalars()
@@ -171,7 +178,7 @@ class Trainer():
                     if opts.plot_scalars:
                         visualizer.plot_current_scalars(epoch, float(epoch_iter)/dataset_size, opts, scalars)
 
-                if total_steps % opts.save_latest_freq == 0:
+                if opts.is_train and (total_steps % opts.save_latest_freq) == 0:
                     print('saving the model at the end of epoch {:d}, iters {:d}'.format(epoch, total_steps))
                     self.save('latest')
 

@@ -94,6 +94,7 @@ def visualize(img, outputs, renderer):
     plt.axis('off')
     plt.draw()
     plt.show()
+    plt.waitforbuttonpress()
     import ipdb
     ipdb.set_trace()
 
@@ -104,7 +105,22 @@ def main(_):
 
     batch = {'img': torch.Tensor(np.expand_dims(img, 0))}
 
+
+    # import ipdb; ipdb.set_trace()
     predictor = pred_util.MeshPredictor(opts)
+
+    # Save meah shape to file
+    mean_shape_v = predictor.model.get_mean_shape()
+    mean_shape_uv = predictor.model.get_mean_shape_uv()
+    mean_shape_f = predictor.faces.squeeze(0)
+
+    import ipdb; ipdb.set_trace()
+
+    verts_uv = mean_shape_uv.cpu().numpy()
+    verts = mean_shape_v.detach().cpu().data.numpy()
+    faces = mean_shape_f.detach().cpu().data.numpy()
+    np.save('mean_birds_shape',{'verts_uv':verts_uv,'verts':verts,'faces':faces})
+
     outputs = predictor.predict(batch)
 
     # This is resolution

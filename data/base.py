@@ -41,6 +41,8 @@ flags.DEFINE_float('jitter_frac', 0.05,
 flags.DEFINE_enum('split', 'train', ['train', 'val', 'all', 'test'], 'eval split')
 flags.DEFINE_integer('num_kps', 15, 'The dataloader should override these.')
 flags.DEFINE_integer('n_data_workers', 4, 'Number of data loading workers')
+flags.DEFINE_boolean('flip', True, 'Random flip input image')
+flags.DEFINE_list('single_datapoint', '', 'Debug on single element (provide index)')
 
 
 # -------------- Dataset ------------- #
@@ -106,7 +108,7 @@ class BaseDataset(Dataset):
         img, mask, kp, sfm_pose = self.scale_image(img, mask, kp, vis, sfm_pose)
 
         # Mirror image on random.
-        if self.opts.split == 'train':
+        if (self.opts.split == 'train') and (self.opts.flip):
             img, mask, kp, sfm_pose = self.mirror_image(img, mask, kp, sfm_pose)
 
         # Normalize kp to be [-1, 1]
@@ -182,6 +184,13 @@ class BaseDataset(Dataset):
         return self.num_imgs
 
     def __getitem__(self, index):
+        # if index == 1452:
+        #     pdb.set_trace()
+        datapoints = self.opts.single_datapoint
+        datapoints = [int(x) for x in datapoints]
+        if len(datapoints) >= 0:
+            index = datapoints[index % len(datapoints)]
+
         img, kp, mask, sfm_pose = self.forward_img(index)
         sfm_pose[0].shape = 1
 

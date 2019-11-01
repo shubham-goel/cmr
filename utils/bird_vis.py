@@ -50,6 +50,8 @@ class VisRenderer(object):
             torch.FloatTensor(cam).cuda(), requires_grad=False)
         self.default_cam = torch.unsqueeze(self.default_cam, 0)
 
+        self.set_light_dir([0, 1, -1], 0.38)
+
     def __call__(self, verts, cams=None, texture=None, rend_mask=False):
         """
         verts is |V| x 3 cuda torch Variable

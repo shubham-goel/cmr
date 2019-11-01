@@ -25,13 +25,15 @@ from ..utils import transformations
 
 # -------------- flags ------------- #
 # ---------------------------------- #
-if osp.exists('/scratch1/storage'):
+if osp.exists('/data3/shubham/birds_data/CUB_200_2011'):
+    kData = '/data3/shubham/birds_data/CUB_200_2011'
+elif osp.exists('/scratch1/storage'):
     kData = '/scratch1/storage/CUB'
 elif osp.exists('/data1/shubhtuls'):
     kData = '/data0/shubhtuls/datasets/CUB'
 else:  # Savio
     kData = '/global/home/users/kanazawa/scratch/CUB'
-    
+
 flags.DEFINE_string('cub_dir', kData, 'CUB Data Directory')
 
 curr_path = osp.dirname(osp.abspath(__file__))

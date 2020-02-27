@@ -19,7 +19,7 @@ import scipy.io as sio
 
 from ..nnutils import mesh_net
 from ..nnutils import geom_utils
-from ..nnutils.nmr import NeuralRenderer
+from ..nnutils.nmr import NeuralRenderer_pytorch as NeuralRenderer
 from ..utils import bird_vis
 
 # These options are off by default, but used for some ablations reported.
@@ -145,7 +145,7 @@ class MeshPredictor(object):
         # Project keypoints
         self.kp_pred = self.renderer.project_points(self.kp_verts,
                                                     self.cam_pred)
-        self.mask_pred = self.renderer.forward(self.pred_v, self.faces,
+        self.mask_pred = self.renderer.forward(self.pred_v, self.faces.int(),
                                                self.cam_pred)
 
         # Render texture.
@@ -162,7 +162,7 @@ class MeshPredictor(object):
 
             # Render texture:
             self.texture_pred = self.tex_renderer.forward(
-                self.pred_v, self.faces, self.cam_pred, textures=self.textures)
+                self.pred_v, self.faces.int(), self.cam_pred, textures=self.textures)
 
             # B x 2 x H x W
             uv_flows = self.model.texture_predictor.uvimage_pred

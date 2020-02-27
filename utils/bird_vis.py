@@ -11,7 +11,7 @@ from torch.autograd import Variable
 import numpy as np
 import cv2
 
-from ..nnutils.nmr import NeuralRenderer
+from ..nnutils.nmr import NeuralRenderer_pytorch as NeuralRenderer
 from ..utils import transformations
 
 
@@ -155,7 +155,7 @@ class VisRenderer(object):
         self.renderer.set_bgcolor(color)
 
     def set_light_dir(self, direction, int_dir=0.8, int_amb=0.8):
-        renderer = self.renderer.renderer.renderer
+        renderer = self.renderer.renderer
         renderer.light_direction = direction
         renderer.light_intensity_directional = int_dir
         renderer.light_intensity_ambient = int_amb

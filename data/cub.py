@@ -29,6 +29,8 @@ if osp.exists('/data3/shubham/birds_data/CUB_200_2011'):
     kData = '/data3/shubham/birds_data/CUB_200_2011'
 elif osp.exists('/scratch1/storage'):
     kData = '/scratch1/storage/CUB'
+elif osp.exists('/home/shubham/data/birds_data_rsync/birds_data/CUB_200_2011/'):
+    kData = '/home/shubham/data/birds_data_rsync/birds_data/CUB_200_2011/'
 elif osp.exists('/data1/shubhtuls'):
     kData = '/data0/shubhtuls/datasets/CUB'
 else:  # Savio

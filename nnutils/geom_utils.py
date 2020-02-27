@@ -8,6 +8,13 @@ from __future__ import print_function
 import torch
 
 
+def reflect_cam_pose(cam_pose):
+    batch_dims = cam_pose.dim()-1
+    cam_pose = cam_pose * torch.tensor([1, -1, 1, 1, 1, -1, -1],
+                                        dtype=cam_pose.dtype,
+                                        device=cam_pose.device).view((1,)*batch_dims + (-1,))
+    return cam_pose
+
 def sample_textures(texture_flow, images):
     """
     texture_flow: B x F x T x T x 2

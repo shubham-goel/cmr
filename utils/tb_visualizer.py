@@ -26,7 +26,7 @@ class TBVisualizer():
         log_name = datetime.now().strftime('%H_%M_%d_%m_%Y')
         print("Logging to {}".format(log_name))
         self.display_id = opt.display_id
-        self.use_html = opt.is_train and opt.use_html
+        # self.use_html = opt.is_train and opt.use_html
         self.win_size = opt.display_winsize
         self.name = opt.name
         # self.viz = Logger(self.log_dir,opt.name)

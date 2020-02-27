@@ -13,7 +13,7 @@ class Visualizer():
         self.win_size = opt.display_winsize
         self.name = opt.name
         if self.display_id > 0:
-            self.vis = visdom.Visdom(port = opt.display_port)
+            self.vis = visdom.Visdom(server=opt.display_server, port = opt.display_port, env=opt.name)
             self.display_single_pane_ncols = opt.display_single_pane_ncols
 
         self.log_name = os.path.join(opt.checkpoint_dir, opt.name, 'loss_log.txt')

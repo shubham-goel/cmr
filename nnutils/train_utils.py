@@ -11,6 +11,8 @@ import os.path as osp
 import time
 import pdb
 from absl import flags
+from tqdm import tqdm
+import numpy as np
 
 from ..utils.visualizer import Visualizer
 from ..utils.tb_visualizer import TBVisualizer
@@ -39,18 +41,50 @@ flags.DEFINE_string('checkpoint_dir', osp.join(cache_path, 'snapshots'),
                     'Root directory for output files')
 flags.DEFINE_integer('print_freq', 20, 'scalar logging frequency')
 flags.DEFINE_integer('save_latest_freq', 10000, 'save latest model every x iterations')
-flags.DEFINE_integer('save_epoch_freq', 50, 'save model every k epochs')
+flags.DEFINE_integer('save_epoch_freq', 10, 'save model every k epochs')
 
 ## Flags for visualization
-flags.DEFINE_integer('display_freq', 100, 'visuals logging frequency')
-flags.DEFINE_boolean('display_visuals', False, 'whether to display images')
+flags.DEFINE_integer('display_freq', 1000, 'visuals logging frequency')
+flags.DEFINE_boolean('display_visuals', True, 'whether to display images')
 flags.DEFINE_boolean('print_scalars', True, 'whether to print scalars')
-flags.DEFINE_boolean('plot_scalars', False, 'whether to plot scalars')
+flags.DEFINE_boolean('plot_scalars', True, 'whether to plot scalars')
 flags.DEFINE_boolean('is_train', True, 'Are we training ?')
 flags.DEFINE_integer('display_id', 1, 'Display Id')
 flags.DEFINE_integer('display_winsize', 256, 'Display Size')
+flags.DEFINE_string('display_server', 'http://maul.banatao.berkeley.edu', 'Display server')
 flags.DEFINE_integer('display_port', 8097, 'Display port')
 flags.DEFINE_integer('display_single_pane_ncols', 0, 'if positive, display all images in a single visdom web panel with certain number of images per row.')
+
+
+class RecentList():
+    def __init__(self,max_size=10):
+        assert(max_size > 0)
+        self.max_size = max_size
+        self.list = []
+        self.csum = 0
+    def append(self, x):
+        if len(self.list) == self.max_size:
+            self.csum -= self.list[0]
+            self.list.pop(0)
+        x = float(x)
+        self.list.append(x)
+        self.csum += x
+    def average(self):
+        return self.csum/(len(self.list) + 1e-12)
+
+class AverageMeter():
+    def __init__(self, max_size=10):
+        self.csum = 0
+        self.count = 0
+        self.recent = RecentList(max_size=max_size)
+    def append(self, x):
+        self.csum += float(x)
+        self.count += 1
+        self.recent.append(x)
+    def average(self):
+        return self.csum/(self.count + 1e-12)
+    def recent_average(self):
+        return self.recent.average()
 
 #-------- tranining class ---------#
 #----------------------------------#
@@ -126,7 +160,7 @@ class Trainer():
 
     def init_training(self):
         opts = self.opts
-        self.init_dataset()    
+        self.init_dataset()
         self.define_model()
         self.define_criterion()
         if opts.use_sgd:
@@ -150,14 +184,19 @@ class Trainer():
 
         for epoch in range(opts.num_pretrain_epochs, opts.num_epochs):
             epoch_iter = 0
-            for i, batch in enumerate(self.dataloader):
+            loss_meter = AverageMeter()
+
+            pbar = tqdm(self.dataloader,dynamic_ncols=True,total=dataset_size,desc='e{}'.format(epoch))
+            for i, batch in enumerate(pbar):
                 iter_start_time = time.time()
                 self.set_input(batch)
                 if not self.invalid_batch:
                     self.optimizer.zero_grad()
                     self.forward()
-                    self.smoothed_total_loss = self.smoothed_total_loss*0.99 + 0.01*self.total_loss.data[0]
+                    self.smoothed_total_loss = self.smoothed_total_loss*0.99 + 0.01*self.total_loss.item()
                     if opts.is_train:
+                        # self.pred_v_copy.retain_grad()
+                        # assert(self.pred_v_copy.retains_grad)
                         self.total_loss.backward()
                         # pdb.set_trace()
                         self.optimizer.step()
@@ -167,16 +206,21 @@ class Trainer():
 
                 if opts.display_visuals and (total_steps % opts.display_freq == 0):
                     iter_end_time = time.time()
-                    print('time/itr %.2g' % ((iter_end_time - iter_start_time)/opts.display_freq))
-                    # visualizer.display_current_results(self.get_current_visuals(), epoch)
-                    tb_visualizer.display_current_results({'img':self.get_current_visuals()}, total_steps)
-                    # tb_visualizer.plot_current_points(self.get_current_points())
+                    # print('time/itr %.2g' % ((iter_end_time - iter_start_time)/opts.display_freq))
+                    visuals = self.get_current_visuals()
+                    visualizer.display_current_results(visuals, epoch)
+                    visualizer.plot_current_points(self.get_current_points())
+                    # tb_visualizer.display_current_results({'img':visuals}, total_steps)
 
                 if opts.print_scalars and (total_steps % opts.print_freq == 0):
                     scalars = self.get_current_scalars()
-                    visualizer.print_current_scalars(epoch, epoch_iter, scalars)
+                    # visualizer.print_current_scalars(epoch, epoch_iter, scalars)
                     if opts.plot_scalars:
                         visualizer.plot_current_scalars(epoch, float(epoch_iter)/dataset_size, opts, scalars)
+
+                loss_meter.append(self.total_loss.item())
+                pbar.set_postfix(iter=total_steps, loss_avg=loss_meter.average(), loss_recent=loss_meter.recent_average())
+
 
                 if opts.is_train and (total_steps % opts.save_latest_freq) == 0:
                     print('saving the model at the end of epoch {:d}, iters {:d}'.format(epoch, total_steps))
@@ -185,7 +229,36 @@ class Trainer():
                 if total_steps == opts.num_iter:
                     return
 
-            if (epoch+1) % opts.save_epoch_freq == 0:
+            if opts.is_train and ((epoch+1) % opts.save_epoch_freq == 0):
                 print('saving the model at the end of epoch {:d}, iters {:d}'.format(epoch, total_steps))
                 self.save('latest')
                 self.save(epoch+1)
+
+            if opts.save_camera_pose_dict:
+
+                if opts.render_mean_shape_only:
+                    nodeform = '_noDeform'
+                else:
+                    nodeform = ''
+
+                if (len(self.datasetCameraPoseDict)!=len(self.dataloader.dataset)):
+                    print('Saving cam_pose_dict of size ',len(self.datasetCameraPoseDict),'!=',len(self.dataloader.dataset))
+                path = 'birds/cmr_'+opts.split+'_'+opts.name+nodeform+'_campose_'+str(epoch)
+                stats = {'campose':self.datasetCameraPoseDict}
+                np.savez(path, **stats)
+
+                path = 'birds/cmr_'+opts.split+'_'+opts.name+'_maskiou_'+str(epoch)
+                stats = {'maskiou':self.datasetMaskIouDict}
+                np.savez(path, **stats)
+
+                path = 'birds/cmr_'+opts.split+'_'+opts.name+'_noDeform_maskiou_'+str(epoch)
+                stats = {'maskiou':self.datasetMaskIouMsDict}
+                np.savez(path, **stats)
+                
+                path = 'birds/cmr_'+opts.split+'_'+opts.name+'_GtCam_maskiou_'+str(epoch)
+                stats = {'maskiou':self.datasetMaskIouGtCamDict}
+                np.savez(path, **stats)
+
+                path = 'birds/cmr_'+opts.split+'_'+opts.name+'_noDeform_GTCam_maskiou_'+str(epoch)
+                stats = {'maskiou':self.datasetMaskIouMsGtCamDict}
+                np.savez(path, **stats)

@@ -20,6 +20,7 @@ import scipy.misc
 import scipy.linalg
 import scipy.ndimage.interpolation
 from absl import flags, app
+import cv2
 
 import torch
 from torch.utils.data import Dataset
@@ -43,6 +44,7 @@ flags.DEFINE_integer('num_kps', 15, 'The dataloader should override these.')
 flags.DEFINE_integer('n_data_workers', 4, 'Number of data loading workers')
 flags.DEFINE_boolean('flip', True, 'Random flip input image')
 flags.DEFINE_list('single_datapoint', '', 'Debug on single element (provide index)')
+flags.DEFINE_boolean('drop_last', True, 'Drop last batch')
 
 
 # -------------- Dataset ------------- #
@@ -76,7 +78,8 @@ class BaseDataset(Dataset):
         sfm_pose[2] = transformations.quaternion_from_matrix(sfm_rot, isprecise=True)
 
         img_path = osp.join(self.img_dir, str(data.rel_path))
-        img = scipy.misc.imread(img_path) / 255.0
+        img = cv2.imread(img_path) / 255.0
+        img = img[:,:,::-1]
         # Some are grayscale:
         if len(img.shape) == 2:
             img = np.repeat(np.expand_dims(img, 2), 3, axis=2)
@@ -188,7 +191,7 @@ class BaseDataset(Dataset):
         #     pdb.set_trace()
         datapoints = self.opts.single_datapoint
         datapoints = [int(x) for x in datapoints]
-        if len(datapoints) >= 0:
+        if len(datapoints) > 0:
             index = datapoints[index % len(datapoints)]
 
         img, kp, mask, sfm_pose = self.forward_img(index)
@@ -227,4 +230,4 @@ def base_loader(d_set_func, batch_size, opts, filter_key=None, shuffle=True):
         batch_size=batch_size,
         shuffle=shuffle,
         num_workers=opts.n_data_workers,
-        drop_last=True)
+        drop_last=opts.drop_last)

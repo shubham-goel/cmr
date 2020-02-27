@@ -9,6 +9,20 @@ from __future__ import print_function
 import torch
 from . import geom_utils
 import numpy as np
+from scipy import sparse
+
+
+def maskiou(mask1, mask2):
+    """
+    masks: ...,h,w
+    returns: ...
+    """
+    mask1 = mask1>0.5
+    mask2 = mask2>0.5
+    I = (mask1 & mask2).sum(dim=(-1,-2)).float()
+    U = (mask1 | mask2).sum(dim=(-1,-2)).float()
+    return I/(U + 1e-4)
+
 
 def mask_dt_loss(proj_verts, dist_transf):
     """
@@ -313,16 +327,84 @@ class LaplacianLoss(object):
     def __init__(self, faces):
         # Input:
         #  faces: B x F x 3
-        from ..nnutils.laplacian import Laplacian
+        from ..nnutils.laplacian import Laplacian, cotangent
         # V x V
-        self.laplacian = Laplacian(faces)
+        self.laplacian = Laplacian.apply
+        self.cotangent = cotangent
+
+        self.F_np = faces.data.cpu().numpy()
+        self.F = faces.data
+        self.L = None
+
         self.Lx = None
 
     def __call__(self, verts):
-        self.Lx = self.laplacian(verts)
+        
+        if self.L is None:
+            V_np = verts.detach().cpu().numpy()
+            batchV = V_np.reshape(-1, 3)
+            print('Computing the Laplacian!')
+            # Compute cotangents
+            C = self.cotangent(verts, self.F)
+            C_np = C.detach().cpu().numpy()
+            batchC = C_np.reshape(-1, 3)
+            # Adjust face indices to stack:
+            offset = np.arange(0, verts.size(0)).reshape(-1, 1, 1) * verts.size(1)
+            F_np = self.F_np + offset
+            batchF = F_np.reshape(-1, 3)
+
+            rows = batchF[:, [1, 2, 0]].reshape(-1)
+            cols = batchF[:, [2, 0, 1]].reshape(-1)
+            # Final size is BN x BN
+            BN = batchV.shape[0]
+            L = sparse.csr_matrix((batchC.reshape(-1), (rows, cols)), shape=(BN,BN))
+            L = L + L.T
+            # np.sum on sparse is type 'matrix', so convert to np.array
+            M = sparse.diags(np.array(np.sum(L, 1)).reshape(-1), format='csr')
+            L = L - M
+            # remember this
+            self.L = L
+            self.L_dense = torch.tensor(L.todense(), dtype=verts.dtype, device=verts.device)
+
+            # def to_sparse(x):
+            #     """ converts dense tensor x to sparse format """
+            #     x_typename = torch.typename(x).split('.')[-1]
+            #     sparse_tensortype = getattr(torch.sparse, x_typename)
+
+            #     indices = torch.nonzero(x)
+            #     if len(indices.shape) == 0:  # if all elements are zeros
+            #         return sparse_tensortype(*x.shape)
+            #     indices = indices.t()
+            #     values = x[tuple(indices[i] for i in range(indices.shape[0]))]
+            #     return sparse_tensortype(indices, values, x.size(), device=x.device)
+
+            # self.L_sparse = to_sparse(self.L_dense)
+
+            # import matplotlib.pylab as plt
+            # plt.ion()
+            # plt.clf()
+            # plt.spy(L)
+            # plt.show()
+            # import ipdb; ipdb.set_trace()
+
+
+        # import ipdb; ipdb.set_trace()
+        # verts.register_hook(lambda x: print('LaplacianLoss:verts', x))
+        
+        
+        # Lx = self.laplacian(verts, self.L)
+
+        batchV = verts.view(-1, 3)
+        Lx = (self.L_dense @ batchV).view(verts.shape)
+        # Lx = torch.sparse.mm(self.L_sparse, batchV).view(verts.shape)
+
+
+        # Lx.register_hook(lambda x: print('LaplacianLoss:Lx_0', x))
         # Reshape to BV x 3
-        Lx = self.Lx.view(-1, self.Lx.size(2))
+        Lx = Lx.view(-1, Lx.size(2))
+        # Lx.register_hook(lambda x: print('LaplacianLoss:Lx_1', x))
         loss = torch.norm(Lx, p=2, dim=1).mean()
+        # loss.register_hook(lambda x: print('LaplacianLoss:loss', x))
         return loss
 
     def visualize(self, verts, mv=None):

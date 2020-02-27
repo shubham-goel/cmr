@@ -1,3 +1,5 @@
+venv_cmr/*
+
 *.DS_Store
 .ipynb_checkpoints
 *.pyc

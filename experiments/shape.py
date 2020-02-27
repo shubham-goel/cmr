@@ -20,6 +20,8 @@ from absl import flags
 import os.path as osp
 import numpy as np
 import torch
+torch.backends.cudnn.benchmark = True
+
 import torchvision
 from torch.autograd import Variable
 import scipy.io as sio
@@ -32,7 +34,8 @@ from ..utils import image as image_utils
 from ..nnutils import train_utils
 from ..nnutils import loss_utils
 from ..nnutils import mesh_net
-from ..nnutils.nmr import NeuralRenderer
+from ..nnutils.nmr import NeuralRenderer_pytorch as NeuralRenderer
+from ..nnutils.nmr import SoftRas
 from ..nnutils import geom_utils
 
 flags.DEFINE_string('dataset', 'cub', 'cub or pascal or p3d')
@@ -46,6 +49,13 @@ flags.DEFINE_float('vert2kp_loss_wt', .16, 'reg to vertex assignment')
 flags.DEFINE_float('tex_loss_wt', .5, 'weights to tex loss')
 flags.DEFINE_float('tex_dt_loss_wt', .5, 'weights to tex dt loss')
 flags.DEFINE_boolean('use_gtpose', True, 'if true uses gt pose for projection, but camera still gets trained.')
+flags.DEFINE_enum('renderer', 'nmr', ['nmr','softras'], 'What renderer to use')
+flags.DEFINE_boolean('texture_detach_shape', True, 'if true detach shape, camera while predicting texture.')
+flags.DEFINE_boolean('save_camera_pose_dict', False, 'Save camera pose dict for entire dataset to file')
+flags.DEFINE_boolean('save_maskiou_dict', False, 'Save maskiou dict for entire dataset to file')
+flags.DEFINE_boolean('render_mean_shape_only', False, 'Render mean shape only')
+flags.DEFINE_float('delta_v_scale', 1, 'scale for delta_v')
+flags.DEFINE_boolean('nokp', False, 'No-keypoints')
 
 opts = flags.FLAGS
 
@@ -70,7 +80,7 @@ class ShapeTrainer(train_utils.Trainer):
 
         if opts.num_pretrain_epochs > 0:
             self.load_network(self.model, 'pred', opts.num_pretrain_epochs)
-        
+
         if not opts.is_train:
             self.model.eval()
 
@@ -84,17 +94,29 @@ class ShapeTrainer(train_utils.Trainer):
         # For renderering.
         faces = self.model.faces.view(1, -1, 3)
         self.faces = faces.repeat(opts.batch_size, 1, 1)
-        self.renderer = NeuralRenderer(opts.img_size)
-        self.renderer_predcam = NeuralRenderer(opts.img_size) #for camera loss via projection
+        if opts.renderer == 'nmr':
+            renderer_class = NeuralRenderer
+        else:
+            renderer_class = SoftRas
+
+        self.renderer = renderer_class(opts.img_size)
+        self.renderer_predcam = renderer_class(opts.img_size) #for camera loss via projection
 
         # Need separate NMR for each fwd/bwd call.
         if opts.texture:
-            self.tex_renderer = NeuralRenderer(opts.img_size)
+            self.tex_renderer = renderer_class(opts.img_size, light_intensity_ambient=1.0, light_intensity_directionals=0.0)
             # Only use ambient light for tex renderer
             self.tex_renderer.ambient_light_only()
 
         # For visualization
         self.vis_rend = bird_vis.VisRenderer(opts.img_size, faces.data.cpu().numpy())
+
+        # Save cameras
+        self.datasetCameraPoseDict = {}
+        self.datasetMaskIouDict = {}
+        self.datasetMaskIouMsDict = {}
+        self.datasetMaskIouGtCamDict = {}
+        self.datasetMaskIouMsGtCamDict = {}
         return
 
     def init_dataset(self):
@@ -133,7 +155,7 @@ class ShapeTrainer(train_utils.Trainer):
         mask_tensor = batch['mask'].type(torch.FloatTensor)
         kp_tensor = batch['kp'].type(torch.FloatTensor)
         cam_tensor = batch['sfm_pose'].type(torch.FloatTensor)
-        self.frame_id = batch['inds'].type(torch.LongTensor)
+        self.frame_id = batch['inds'].type(torch.LongTensor).cuda()
 
         self.input_imgs = Variable(
             input_img_tensor.cuda(device=opts.gpu_id), requires_grad=False)
@@ -152,6 +174,18 @@ class ShapeTrainer(train_utils.Trainer):
         # B x 1 x N x N
         self.dts_barrier = Variable(dt_tensor, requires_grad=False).unsqueeze(1)
 
+        # Complete batch
+        if self.input_imgs.shape[0]!=opts.batch_size:
+            indices = torch.arange(opts.batch_size, dtype=torch.long, device=self.input_imgs.device)
+            indices[indices>=self.input_imgs.shape[0]] = self.input_imgs.shape[0]-1
+            self.frame_id = torch.index_select(self.frame_id, 0, indices)
+            self.input_imgs = torch.index_select(self.input_imgs, 0, indices)
+            self.imgs = torch.index_select(self.imgs, 0, indices)
+            self.masks = torch.index_select(self.masks, 0, indices)
+            self.kps = torch.index_select(self.kps, 0, indices)
+            self.cams = torch.index_select(self.cams, 0, indices)
+            self.dts_barrier = torch.index_select(self.dts_barrier, 0, indices)
+
     def forward(self):
         opts = self.opts
         if opts.texture:
@@ -169,14 +203,17 @@ class ShapeTrainer(train_utils.Trainer):
 
         # Deform mean shape:
         self.mean_shape = self.model.get_mean_shape()
-        self.pred_v = self.mean_shape + del_v
+        if opts.render_mean_shape_only:
+            self.pred_v = self.mean_shape + del_v*0
+        else:
+            self.pred_v = self.mean_shape + del_v*opts.delta_v_scale
 
         # Compute keypoints.
         self.vert2kp = torch.nn.functional.softmax(self.model.vert2kp, dim=1)
         self.kp_verts = torch.matmul(self.vert2kp, self.pred_v)
 
         # Decide which camera to use for projection.
-        if opts.use_gtpose:
+        if opts.use_gtpose and (opts.nokp==False):
             proj_cam = self.cams
         else:
             proj_cam = self.cam_pred
@@ -185,22 +222,43 @@ class ShapeTrainer(train_utils.Trainer):
         self.kp_pred = self.renderer.project_points(self.kp_verts, proj_cam)
 
         # Render mask.
-        self.mask_pred = self.renderer.forward(self.pred_v, self.faces, proj_cam)
+        self.mask_pred = self.renderer.forward(self.pred_v, self.faces.int(), proj_cam)
+        if opts.save_maskiou_dict:
+            self.mask_pred_ms = self.renderer.forward(self.mean_shape + del_v*0, self.faces.int(), proj_cam)
+            self.mask_pred_gtcam = self.renderer.forward(self.pred_v, self.faces.int(), self.cams)
+            self.mask_pred_ms_gtcam = self.renderer.forward(self.mean_shape + del_v*0, self.faces.int(), self.cams)
 
         if opts.texture:
             self.texture_flow = self.textures
             self.textures = geom_utils.sample_textures(self.texture_flow, self.imgs)
             tex_size = self.textures.size(2)
             self.textures = self.textures.unsqueeze(4).repeat(1, 1, 1, 1, tex_size, 1)
-  
-            self.texture_pred = self.tex_renderer.forward(self.pred_v.detach(), self.faces, proj_cam.detach(), textures=self.textures)
+
+            if opts.texture_detach_shape:
+                self.texture_pred = self.tex_renderer.forward(self.pred_v.detach(), self.faces.int(), proj_cam.detach(), textures=self.textures)
+            else:
+                self.texture_pred = self.tex_renderer.forward(self.pred_v, self.faces.int(), proj_cam, textures=self.textures)
         else:
             self.textures = None
 
         # Compute losses for this instance.
-        self.kp_loss = self.projection_loss(self.kp_pred, self.kps)
+        if not opts.nokp:
+            self.kp_loss = self.projection_loss(self.kp_pred, self.kps)
+            self.cam_loss = self.camera_loss(self.cam_pred, self.cams, 0)
+        else:
+            self.kp_loss = torch.tensor(0, dtype=torch.float, device=self.input_imgs.device)
+            self.cam_loss = torch.tensor(0, dtype=torch.float, device=self.input_imgs.device)
         self.mask_loss = self.mask_loss_fn(self.mask_pred, self.masks)
-        self.cam_loss = self.camera_loss(self.cam_pred, self.cams, 0)
+
+        self.mask_iou = loss_utils.maskiou(self.mask_pred, self.masks)
+        if opts.save_maskiou_dict:
+            self.mask_iou_ms = loss_utils.maskiou(self.mask_pred_ms, self.masks)
+            self.mask_iou_gtcam = loss_utils.maskiou(self.mask_pred_gtcam, self.masks)
+            self.mask_iou_ms_gtcam = loss_utils.maskiou(self.mask_pred_ms_gtcam, self.masks)
+        else:
+            self.mask_iou_ms = self.mask_iou
+            self.mask_iou_gtcam = self.mask_iou
+            self.mask_iou_ms_gtcam = self.mask_iou
 
         if opts.texture:
             self.tex_loss = self.texture_loss(self.texture_pred, self.imgs, self.mask_pred, self.masks)
@@ -209,24 +267,78 @@ class ShapeTrainer(train_utils.Trainer):
             self.tex_dt_loss = torch.zeros_like(self.cam_loss)
 
         # Priors:
-        self.vert2kp_loss = self.entropy_loss(self.vert2kp)
+        if not opts.nokp:
+            self.vert2kp_loss = self.entropy_loss(self.vert2kp)
+        else:
+            self.vert2kp_loss = torch.tensor(0, dtype=torch.float, device=self.input_imgs.device)
         self.deform_reg = self.deform_reg_fn(self.delta_v)
-        self.triangle_loss = self.triangle_loss_fn(self.pred_v)
+
+        self.pred_v_copy = self.pred_v + 0
+        self.triangle_loss = self.triangle_loss_fn(self.pred_v_copy)
 
         # Finally sum up the loss.
         # Instance loss:
-        self.total_loss = opts.kp_loss_wt * self.kp_loss
+        self.total_loss = torch.tensor(0, dtype=torch.float, device=self.input_imgs.device)
         self.total_loss += opts.mask_loss_wt * self.mask_loss
-        self.total_loss += opts.cam_loss_wt * self.cam_loss
         if opts.texture:
             self.total_loss += opts.tex_loss_wt * self.tex_loss
+        if not opts.nokp:
+            self.total_loss += opts.kp_loss_wt * self.kp_loss
+            self.total_loss += opts.cam_loss_wt * self.cam_loss
 
         # Priors:
-        self.total_loss += opts.vert2kp_loss_wt * self.vert2kp_loss
+        if not opts.nokp:
+            self.total_loss += opts.vert2kp_loss_wt * self.vert2kp_loss
         self.total_loss += opts.deform_reg_wt * self.deform_reg
         self.total_loss += opts.triangle_reg_wt * self.triangle_loss
 
         self.total_loss += opts.tex_dt_loss_wt * self.tex_dt_loss
+
+
+        if opts.save_camera_pose_dict:
+            cam_pred_multipose = self.cam_pred[:,None,:]
+            quat_score = torch.ones_like(cam_pred_multipose[:,:,0])
+            self.update_camera_pose_dict(self.frame_id.squeeze(-1), cam_pred_multipose, quat_score, self.cams[:,:3], 
+                self.mask_iou[:,None], self.mask_iou_ms[:,None], self.mask_iou_gtcam[:,None], self.mask_iou_ms_gtcam[:,None],)
+
+    
+    def update_camera_pose_dict(self, frameids, cams, scores, gt_st, maskious, maskious_ms, maskious_gtcam, maskious_ms_gtcam):
+        ## Dictionary of all camera poses
+        # dict[frameid] = (Px7: [scale trans quat], P:score, 3:gtscale gttrans)
+        assert(frameids.shape[0] == cams.shape[0] == scores.shape[0] == gt_st.shape[0])
+        assert(frameids.dim()==1)
+        assert(scores.dim()==2)
+        assert(maskious.dim()==2)
+        assert(gt_st.dim()==2)
+        assert(cams.dim()==3)
+
+        frameids = frameids.detach()
+        cams = cams.detach()
+        scores = scores.detach()
+        gt_st = gt_st.detach()
+        maskious = maskious.detach()
+
+        frame_id_isflip = frameids > (int(1e6)-frameids)
+        flip_cams = geom_utils.reflect_cam_pose(cams)
+        flip_gt_st = gt_st * torch.tensor([1,-1,1], dtype=gt_st.dtype, device=gt_st.device)
+        gt_st = torch.where(frame_id_isflip[:,None], flip_gt_st, gt_st)
+        cams = torch.where(frame_id_isflip[:,None,None], flip_cams, cams)
+        frameids = torch.where(frame_id_isflip, int(1e6)-frameids, frameids)
+
+        for i in range(frameids.shape[0]):
+            f = frameids[i].item()
+            if f not in self.datasetCameraPoseDict:
+                # print(cams[i,:,:].shape)
+                # print(scores[i,:].shape)
+                # print(gt_st[i,:].shape)
+                # print(maskious[i,:].shape)
+                # print('')
+                # import ipdb; ipdb.set_trace()
+                self.datasetCameraPoseDict[f] = (cams[i,:,:].cpu(), scores[i,:].cpu(), gt_st[i,:].cpu())
+                self.datasetMaskIouDict[f] = maskious[i,:].cpu()
+                self.datasetMaskIouMsDict[f] = maskious_ms[i,:].cpu()
+                self.datasetMaskIouGtCamDict[f] = maskious_gtcam[i,:].cpu()
+                self.datasetMaskIouMsGtCamDict[f] = maskious_ms_gtcam[i,:].cpu()
 
 
     def get_current_visuals(self):
@@ -279,6 +391,10 @@ class ShapeTrainer(train_utils.Trainer):
             rend_gtcam = self.vis_rend(self.pred_v[i], self.cams[i], texture=texture_here)
             rends_gt = np.hstack((rend_gtcam, diff_rends_gt, np.zeros(rend_predcam.shape, dtype=diff_rends_gt.dtype)))
             rends = np.hstack((rend_predcam, diff_rends, np.zeros(rend_predcam.shape, dtype=diff_rends_gt.dtype)))
+            if self.opts.texture:
+                rends_gt = np.hstack((rends_gt, np.zeros(rend_predcam.shape, dtype=diff_rends_gt.dtype)))
+                rends = np.hstack((rends, np.zeros(rend_predcam.shape, dtype=diff_rends_gt.dtype)))
+
             hh = np.hstack((imgs, masks))
             vis_dict['%d' % i] = np.vstack((hh, rends_gt, rends))
             vis_dict['masked_img_%d' % i] = bird_vis.tensor2im((self.imgs[i] * self.masks[i]).data)
@@ -299,23 +415,24 @@ class ShapeTrainer(train_utils.Trainer):
     def get_current_scalars(self):
         sc_dict = OrderedDict([
             ('smoothed_total_loss', self.smoothed_total_loss),
-            ('total_loss', self.total_loss.data[0]),
-            ('kp_loss', self.kp_loss.data[0]),
-            ('mask_loss', self.mask_loss.data[0]),
-            ('vert2kp_loss', self.vert2kp_loss.data[0]),
-            ('deform_reg', self.deform_reg.data[0]),
-            ('tri_loss', self.triangle_loss.data[0]),
-            ('cam_loss', self.cam_loss.data[0]),
+            ('total_loss', self.total_loss.item()),
+            ('mask_loss', self.mask_loss.item()),
+            ('deform_reg', self.deform_reg.item()),
+            ('tri_loss', self.triangle_loss.item()),
         ])
+        sc_dict['kp_loss'] = self.kp_loss.item()
+        sc_dict['vert2kp_loss'] = self.vert2kp_loss.item()
+        sc_dict['cam_loss'] = self.cam_loss.item()
         if self.opts.texture:
-            sc_dict['tex_loss'] = self.tex_loss.data[0]
-            sc_dict['tex_dt_loss'] = self.tex_dt_loss.data[0]
+            sc_dict['tex_loss'] = self.tex_loss.item()
+            sc_dict['tex_dt_loss'] = self.tex_dt_loss.item()
 
         return sc_dict
 
 
 def main(_):
     torch.manual_seed(0)
+    torch.cuda.manual_seed(0)
     trainer = ShapeTrainer(opts)
     trainer.init_training()
     trainer.train()

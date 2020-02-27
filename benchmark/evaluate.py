@@ -22,6 +22,7 @@ from ..nnutils import predictor as pred_utils
 from ..utils.bird_vis import convert2np
 
 flags.DEFINE_boolean('visualize', False, 'if true visualizes things')
+flags.DEFINE_boolean('visualize_texture', True, 'if true visualizes things')
 
 opts = flags.FLAGS
 
@@ -35,7 +36,7 @@ class ShapeTester(test_utils.Tester):
         # for visualization
         self.renderer = self.predictor.vis_rend
         self.renderer.set_bgcolor([1., 1., 1.])
-        self.renderer.renderer.renderer.renderer.image_size = 512
+        self.renderer.renderer.renderer.image_size = 512
         self.renderer.set_light_dir([0, 1, -1], 0.38)
 
     def init_dataset(self):
@@ -82,17 +83,20 @@ class ShapeTester(test_utils.Tester):
     def visualize(self, outputs, batch):
         vert = outputs['verts'][0]
         cam = outputs['cam_pred'][0]
-        texture = outputs['texture'][0]
+        if self.opts.visualize_texture:
+            texture = outputs['texture'][0]
+        else:
+            texture = None
 
         img_pred = self.renderer(vert, cam, texture=texture)
         aroundz = []
         aroundy = []
         # for deg in np.arange(0, 180, 30):
-        for deg in np.arange(0, 150, 30):
+        for deg in np.arange(0, 180, 15):
             rendz = self.renderer.diff_vp(
-                vert, cam, angle=-deg, axis=[1, 0, 0], texture=texture)
+                vert, cam, angle=-deg, axis=[1, 0, 0], texture=texture, new_ext=[x.item() for x in cam[:3]])
             rendy = self.renderer.diff_vp(
-                vert, cam, angle=deg, axis=[0, 1, 0], texture=texture)
+                vert, cam, angle=deg, axis=[0, 1, 0], texture=texture, new_ext=[x.item() for x in cam[:3]])
             aroundz.append(rendz)
             aroundy.append(rendy)
 

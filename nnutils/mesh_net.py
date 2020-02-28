@@ -220,7 +220,7 @@ class CodePredictor(nn.Module):
 #------------ Mesh Net ------------#
 #----------------------------------#
 class MeshNet(nn.Module):
-    def __init__(self, input_shape, opts, nz_feat=100, num_kps=15, sfm_mean_shape=None):
+    def __init__(self, input_shape, opts, verts, faces, verts_uv, nz_feat=100, num_kps=15):
         # Input shape is H x W of the image.
         super(MeshNet, self).__init__()
         self.opts = opts
@@ -229,14 +229,14 @@ class MeshNet(nn.Module):
         self.symmetric_texture = opts.symmetric_texture
 
         # Mean shape.
-        verts, faces = mesh.create_sphere(opts.subdivide)
+        # verts, faces = mesh.create_sphere(opts.subdivide)
         num_verts = verts.shape[0]
 
         if self.symmetric:
-            verts, faces, num_indept, num_sym, num_indept_faces, num_sym_faces = mesh.make_symmetric(verts, faces)
-            verts_uv = mesh.get_spherical_coords(verts)
-            if sfm_mean_shape is not None:
-                verts = geom_utils.project_verts_on_mesh(verts, sfm_mean_shape[0], sfm_mean_shape[1])
+            verts, faces, new_verts_order, num_indept, num_sym, num_indept_faces, num_sym_faces = mesh.make_symmetric(verts, faces)
+            verts_uv = verts_uv[new_verts_order,:]
+            # if sfm_mean_shape is not None:
+            #     verts = geom_utils.project_verts_on_mesh(verts, sfm_mean_shape[0], sfm_mean_shape[1])
 
             num_sym_output = num_indept + num_sym
             if opts.only_mean_sym:
@@ -249,17 +249,17 @@ class MeshNet(nn.Module):
             self.num_indept_faces = num_indept_faces
             self.num_sym_faces = num_sym_faces
             # mean shape is only half.
-            self.mean_v = nn.Parameter(torch.Tensor(verts[:num_sym_output]))
+            self.mean_v = nn.Parameter(torch.Tensor(verts[:num_sym_output]).cuda())
             self.mean_v_uv = torch.Tensor(verts_uv[:num_sym_output])
 
             # Needed for symmetrizing..
             self.flip = Variable(torch.ones(1, 3).cuda(), requires_grad=False)
             self.flip[0, 0] = -1
         else:
-            if sfm_mean_shape is not None:
-                verts = geom_utils.project_verts_on_mesh(verts, sfm_mean_shape[0], sfm_mean_shape[1])            
-            self.mean_v = nn.Parameter(torch.Tensor(verts))
-            self.mean_v_uv = torch.Tensor(verts)
+            # if sfm_mean_shape is not None:
+            #     verts = geom_utils.project_verts_on_mesh(verts, sfm_mean_shape[0], sfm_mean_shape[1])
+            self.mean_v = nn.Parameter(torch.Tensor(verts).cuda())
+            self.mean_v_uv = torch.Tensor(verts_uv)
             self.num_output = num_verts
 
         verts_np = verts
@@ -278,11 +278,21 @@ class MeshNet(nn.Module):
 
         if self.pred_texture:
             if self.symmetric_texture:
+                raise NotImplementedError
                 num_faces = self.num_indept_faces + self.num_sym_faces
             else:
                 num_faces = faces.shape[0]
 
-            uv_sampler = mesh.compute_uvsampler(verts_np, faces_np[:num_faces], tex_size=opts.tex_size)
+            verts_sph = mesh.convert_uv_to_3d_coordinates(verts_uv)
+            if opts.renderer=='nmr':
+                uv_sampler = mesh.compute_uvsampler(verts_sph, faces_np[:num_faces], tex_size=opts.tex_size)
+            elif opts.renderer=='softras':
+                uv_sampler_nmr = mesh.compute_uvsampler(verts_sph, faces_np[:num_faces], tex_size=opts.tex_size)
+                uv_sampler = mesh.compute_uvsampler_softras(verts_sph, faces_np[:num_faces], tex_size=opts.tex_size)
+                self.uv_sampler_nmr = torch.FloatTensor(uv_sampler_nmr).cuda()
+            else:
+                raise NotImplementedError
+
             # F' x T x T x 2
             uv_sampler = Variable(torch.FloatTensor(uv_sampler).cuda(), requires_grad=False)
             # B x F' x T x T x 2
@@ -325,10 +335,10 @@ class MeshNet(nn.Module):
 
     def get_mean_shape_uv(self):
         if self.symmetric:
-            # need to flip x -> -x. 
+            # need to flip x -> -x.
             # Change phi -> pi-phi
             # Change u-> 1-u
-            # Reference: 
+            # Reference:
             #   theta = (v+1)/2 * pi
             #   phi   = u * pi
             #   x = torch.sin(theta)*torch.cos(phi)

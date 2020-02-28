@@ -8,7 +8,7 @@ from __future__ import print_function
 
 import numpy as np
 import meshzoo
-
+import torch
 
 def create_sphere(n_subdivide=3):
     # 3 makes 642 verts, 1280 faces,
@@ -27,38 +27,67 @@ def make_symmetric(verts, faces):
     v[:num_indept + num_sym] = A
     v[:-num_sym] = -A[num_indept:]
     """
-    left = verts[:, 0] < 0
-    right = verts[:, 0] > 0
-    center = verts[:, 0] == 0
+    verts = torch.as_tensor(verts)
+    flip_verts = verts * torch.tensor([[-1,1,1]],dtype=verts.dtype,device=verts.device) # N,3
+    # Find kNN btw verts & flip_verts
+    verts_dist_all = (verts[:,None,:] - flip_verts[None,:,:]).norm(dim=-1)
+    verts_dist_min, min_idx = torch.min(verts_dist_all, dim=1)       # N
 
-    left_inds = np.where(left)[0]
-    right_inds = np.where(right)[0]
-    center_inds = np.where(center)[0]
+    has_sym_mask = (verts_dist_min < 1e-6)      # These have a symmetric partner
+    self_mapped_mask = (min_idx==torch.arange(verts.shape[0]))  # These map to themselves
+    left_sym_mask = (verts[:,0] < 0) & has_sym_mask & (~self_mapped_mask)   # These need to be learnt, have sym partner
+    right_sym_idx = min_idx[left_sym_mask]     # These depend on left_sym_mask
+    right_sym_mask = torch.zeros_like(left_sym_mask)
+    right_sym_mask[right_sym_idx] = 1
+    assert((left_sym_mask & right_sym_mask).sum()==0)
+    indep_mask = ~(left_sym_mask | right_sym_mask)  # These need to be learnt, don't have sym partner
+
+
+    left_sym_idx = left_sym_mask.nonzero().squeeze(1)
+    right_partner_idx = min_idx[left_sym_idx]
+    indep_idx = indep_mask.nonzero().squeeze(1)
+
+    # left = verts[:, 0] < -1e-6
+    # right = verts[:, 0] > 1e-6
+    # center = (verts[:, 0] >= -1e-6) & (verts[:, 0] <= 1e-6)
+
+    left_inds = left_sym_idx.numpy()
+    right_inds = right_partner_idx.numpy()
+    center_inds = indep_idx.numpy()
+    verts = verts.numpy()
+
+
+    # left_inds = np.where(left)[0]
+    # right_inds = np.where(right)[0]
+    # center_inds = np.where(center)[0]
 
     num_indept = len(center_inds)
     num_sym = len(left_inds)
     assert(len(left_inds) == len(right_inds))
 
-    # For each right verts, find the corresponding left verts.
-    prop_left_inds = np.hstack([np.where(np.all(verts == np.array([-1, 1, 1]) * verts[ri], 1))[0] for ri in right_inds])
-    assert(prop_left_inds.shape[0] == num_sym)
-    
-    # Make sure right/left order are symmetric.
-    for ind, (ri, li) in enumerate(zip(right_inds, prop_left_inds)):
-        if np.any(verts[ri] != np.array([-1, 1, 1]) * verts[li]):
-            print('bad! %d' % ind)
-            import ipdb; ipdb.set_trace()
-    
-    new_order = np.hstack([center_inds, right_inds, prop_left_inds])
+    # import ipdb; ipdb.set_trace()
+    # # For each right verts, find the corresponding left verts.
+    # prop_left_inds = np.hstack([np.where(np.all(np.abs((verts - np.array([-1, 1, 1]) * verts[ri]))<1e-6, 1))[0] for ri in right_inds])
+    # assert(prop_left_inds.shape[0] == num_sym)
+
+    # # Make sure right/left order are symmetric.
+    # for ind, (ri, li) in enumerate(zip(right_inds, prop_left_inds)):
+    #     if np.any(verts[ri] != np.array([-1, 1, 1]) * verts[li]):
+    #         print('bad! %d' % ind)
+    #         import ipdb; ipdb.set_trace()
+
+    new_order = np.hstack([center_inds, right_inds, left_inds])
     # verts i is now vert j
     ind_perm = np.hstack([np.where(new_order==i)[0] for i in range(verts.shape[0])])
 
     new_verts = verts[new_order, :]
-    new_faces0 = ind_perm[faces]
+    new_faces = ind_perm[faces]
 
-    new_faces, num_indept_faces, num_sym_faces = make_faces_symmetric(new_verts, new_faces0, num_indept, num_sym)
-    
-    return new_verts, new_faces, num_indept, num_sym, num_indept_faces, num_sym_faces
+    # new_faces, num_indept_faces, num_sym_faces = make_faces_symmetric(new_verts, new_faces, num_indept, num_sym)
+    num_indept_faces = new_faces.shape[0]
+    num_sym_faces = 0
+
+    return new_verts, new_faces, new_order, num_indept, num_sym, num_indept_faces, num_sym_faces
 
 def make_faces_symmetric(verts, faces, num_indept_verts, num_sym_verts):
     """
@@ -73,7 +102,7 @@ def make_faces_symmetric(verts, faces, num_indept_verts, num_sym_verts):
     Otherwise, there are two kinds of symmetric faces:
     - v_i is indept, v_j, v_k are not the symmetric paris)
     - all three have symmetric counter verts.
- 
+
     Returns a new set of faces that is in the above order.
     Also, the symmetric face pairs are reordered so that the vertex order is the same.
     i.e. verts[f_id] and verts[f_id_sym] is in the same vertex order, except the x coord are flipped
@@ -143,7 +172,7 @@ def make_faces_symmetric(verts, faces, num_indept_verts, num_sym_verts):
             done_face[sym_fid] = 1
             # Draw
             # tri_sym = Mesh(verts[v_sym_ids], [[0, 1, 2]], vc='red')
-            # mv.set_dynamic_meshes([mesh, tri, tri_sym])                            
+            # mv.set_dynamic_meshes([mesh, tri, tri_sym])
 
     assert(len(left_faces) + len(right_faces) + len(indept_faces) == faces.shape[0])
     # Now concatenate them,,
@@ -204,6 +233,55 @@ def get_spherical_coords(X):
     return np.stack([uu, vv],1)
 
 
+def convert_3d_to_uv_coordinates(X):
+    """
+    X : N,3
+    Returns UV: N,2 normalized to [-1, 1]
+    U: Azimuth: Angle with +X [-pi,pi]
+    V: Inclination: Angle with +Z [0,pi]
+    """
+    if type(X) == torch.Tensor:
+        eps=1e-4
+        rad = torch.norm(X, dim=-1).clamp(min=eps)
+        theta = torch.acos( (X[..., 2] / rad).clamp(min=-1+eps,max=1-eps) )    # Inclination: Angle with +Z [0,pi]
+        phi = torch.atan2(X[..., 1], X[..., 0])  # Azimuth: Angle with +X [-pi,pi]
+        vv = (theta / np.pi) * 2 - 1
+        uu = ((phi + np.pi) / (2*np.pi)) * 2 - 1
+        uv = torch.stack([uu, vv],dim=-1)
+    else:
+        rad = np.linalg.norm(X, axis=-1)
+        theta = np.arccos(X[..., 2] / rad)      # Inclination: Angle with +Z [0,pi]
+        phi = np.arctan2(X[..., 1], X[..., 0])  # Azimuth: Angle with +X [-pi,pi]
+        vv = (theta / np.pi) * 2 - 1
+        uu = ((phi + np.pi) / (2*np.pi)) * 2 - 1
+        uv = np.stack([uu, vv],-1)
+    return uv
+
+
+def convert_uv_to_3d_coordinates(uv, rad=1):
+    '''
+    Takes a uv coordinate between [-1,1] and returns a 3d point on the sphere.
+    uv -- > [......, 2] shape
+
+    U: Azimuth: Angle with +X [-pi,pi]
+    V: Inclination: Angle with +Z [0,pi]
+    '''
+    phi = np.pi*(uv[...,0])
+    theta = np.pi*(uv[...,1]+1)/2
+
+    if type(uv) == torch.Tensor:
+        x = torch.sin(theta)*torch.cos(phi)
+        y = torch.sin(theta)*torch.sin(phi)
+        z = torch.cos(theta)
+        points3d = torch.stack([x,y,z], dim=-1)
+    else:
+        x = np.sin(theta)*np.cos(phi)
+        y = np.sin(theta)*np.sin(phi)
+        z = np.cos(theta)
+        points3d = np.stack([x,y,z], axis=-1)
+    return points3d*rad
+
+
 def compute_uvsampler(verts, faces, tex_size=2):
     """
     For this mesh, pre-computes the UV coordinates for
@@ -219,10 +297,10 @@ def compute_uvsampler(verts, faces, tex_size=2):
     # Compute alpha, beta (this is the same order as NMR)
     v2 = vs[:, 2]
     v0v2 = vs[:, 0] - vs[:, 2]
-    v1v2 = vs[:, 1] - vs[:, 2]    
+    v1v2 = vs[:, 1] - vs[:, 2]
     # F x 3 x T*2
-    samples = np.dstack([v0v2, v1v2]).dot(coords.T) + v2.reshape(-1, 3, 1)    
-    # F x T*2 x 3 points on the sphere 
+    samples = np.dstack([v0v2, v1v2]).dot(coords.T) + v2.reshape(-1, 3, 1)
+    # F x T*2 x 3 points on the sphere
     samples = np.transpose(samples, (0, 2, 1))
 
     # Now convert these to uv.
@@ -232,6 +310,48 @@ def compute_uvsampler(verts, faces, tex_size=2):
     uv = uv.reshape(-1, tex_size, tex_size, 2)
     return uv
 
+
+def compute_uvsampler_softras(verts_sphere, faces, tex_size=2, convert_3d_to_uv=True):
+    """
+    For this mesh, pre-computes the UV coordinates for
+    F x T x T points.
+    Returns F x T x T x 2
+    """
+    # alpha_beta_txtx2x2[i,j,0,0] = i + 1/3
+    # alpha_beta_txtx2x2[i,j,0,1] = j + 1/3
+    # alpha_beta_txtx2x2[i,j,1,0] = i + 2/3
+    # alpha_beta_txtx2x2[i,j,1,1] = j + 2/3
+    alpha_beta_txtx2x2 = np.zeros((tex_size, tex_size, 2, 2)) # last dim for alpha beta
+    alpha_beta_txtx2x2[:,:,:,0] += np.arange(tex_size).reshape(tex_size,1,1)
+    alpha_beta_txtx2x2[:,:,:,1] += np.arange(tex_size).reshape(1,tex_size,1)
+    alpha_beta_txtx2x2[:,:,0,:] += 1/3
+    alpha_beta_txtx2x2[:,:,1,:] += 2/3
+    alpha_beta_txtx2x2 = alpha_beta_txtx2x2 / tex_size
+
+    lower_half = alpha_beta_txtx2x2[:,:,0,:]
+    # upper_half = np.transpose(alpha_beta_txtx2x2[:,:,1,:], (1,0,2))[::-1,::-1,:]
+    upper_half = alpha_beta_txtx2x2[::-1,::-1,1,:]
+    upper_half = np.ascontiguousarray(upper_half)
+    coords_txtx2 = np.where(lower_half.sum(axis=-1, keepdims=True)<1, lower_half, upper_half)
+
+    # coords_txtx2 = np.transpose(coords_txtx2, (1, 0, 2))
+    # coords_txtx2 = np.flip(coords_txtx2,axis=0)
+    # coords_txtx2 = np.flip(coords_txtx2,axis=1)
+    coords_txtx2 = np.ascontiguousarray(coords_txtx2)
+
+    vs = verts_sphere[faces]
+    v0 = vs[:, 2]
+    v0v1 = vs[:, 1] - vs[:, 2]
+    v0v2 = vs[:, 0] - vs[:, 2]
+    samples_Fx3xtxt = np.inner(np.dstack([v0v1, v0v2]), coords_txtx2) + v0.reshape(faces.shape[0], verts_sphere.shape[-1], 1, 1)
+    samples_Fxtxtx3 = np.transpose(samples_Fx3xtxt, (0, 2, 3, 1))
+
+    # Now convert these to uv.
+    if convert_3d_to_uv:
+        uv_Fxtxtx2 =  convert_3d_to_uv_coordinates(samples_Fxtxtx3)
+        return uv_Fxtxtx2
+    else:
+        return samples_Fxtxtx3
 
 def append_obj(mf_handle, vertices, faces):
     for vx in range(vertices.shape[0]):

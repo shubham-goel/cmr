@@ -44,6 +44,7 @@ flags.DEFINE_float('kp_loss_wt', 30., 'keypoint loss weight')
 flags.DEFINE_float('mask_loss_wt', 2., 'mask loss weight')
 flags.DEFINE_float('cam_loss_wt', 2., 'weights to camera loss')
 flags.DEFINE_float('deform_reg_wt', 10., 'reg to deformation')
+flags.DEFINE_float('template_deform_reg_wt', 5., 'reg to deformation')
 flags.DEFINE_float('triangle_reg_wt', 30., 'weights to triangle smoothness prior')
 flags.DEFINE_float('vert2kp_loss_wt', .16, 'reg to vertex assignment')
 flags.DEFINE_float('tex_loss_wt', .5, 'weights to tex loss')
@@ -56,6 +57,8 @@ flags.DEFINE_boolean('save_maskiou_dict', False, 'Save maskiou dict for entire d
 flags.DEFINE_boolean('render_mean_shape_only', False, 'Render mean shape only')
 flags.DEFINE_float('delta_v_scale', 1, 'scale for delta_v')
 flags.DEFINE_boolean('nokp', False, 'No-keypoints')
+
+flags.DEFINE_string('shape_path', 'birds/csm_mesh/bird_mean_shape.npy', 'Path to initial mean shape')
 
 opts = flags.FLAGS
 
@@ -72,11 +75,21 @@ class ShapeTrainer(train_utils.Trainer):
         self.symmetric = opts.symmetric
         anno_sfm_path = osp.join(opts.cub_cache_dir, 'sfm', 'anno_train.mat')
         anno_sfm = sio.loadmat(anno_sfm_path, struct_as_record=False, squeeze_me=True)
-        sfm_mean_shape = (np.transpose(anno_sfm['S']), anno_sfm['conv_tri']-1)
+        # sfm_mean_shape = (np.transpose(anno_sfm['S']), anno_sfm['conv_tri']-1)
+
+        mean_shape = np.load(opts.shape_path,allow_pickle=True,encoding='latin1').item()
+        verts_uv = mean_shape['verts_uv']
+        verts = mean_shape['verts']
+        faces = mean_shape['faces']
+        self.verts_uv = torch.from_numpy(verts_uv).float() # V,3
+        self.verts = torch.from_numpy(verts).float() # V,3
+        self.faces = torch.from_numpy(faces).long()  # F,2
 
         img_size = (opts.img_size, opts.img_size)
         self.model = mesh_net.MeshNet(
-            img_size, opts, nz_feat=opts.nz_feat, num_kps=opts.num_kps, sfm_mean_shape=sfm_mean_shape)
+            img_size, opts, verts, faces, verts_uv, nz_feat=opts.nz_feat, num_kps=opts.num_kps)
+
+        self.template_shape = self.model.get_mean_shape().detach().cuda()
 
         if opts.num_pretrain_epochs > 0:
             self.load_network(self.model, 'pred', opts.num_pretrain_epochs)
@@ -273,6 +286,9 @@ class ShapeTrainer(train_utils.Trainer):
             self.vert2kp_loss = torch.tensor(0, dtype=torch.float, device=self.input_imgs.device)
         self.deform_reg = self.deform_reg_fn(self.delta_v)
 
+        template_deformation = self.pred_v - self.template_shape[None]
+        self.template_deform_reg = self.deform_reg_fn(template_deformation)
+
         self.pred_v_copy = self.pred_v + 0
         self.triangle_loss = self.triangle_loss_fn(self.pred_v_copy)
 
@@ -290,6 +306,7 @@ class ShapeTrainer(train_utils.Trainer):
         if not opts.nokp:
             self.total_loss += opts.vert2kp_loss_wt * self.vert2kp_loss
         self.total_loss += opts.deform_reg_wt * self.deform_reg
+        self.total_loss += opts.template_deform_reg_wt * self.template_deform_reg
         self.total_loss += opts.triangle_reg_wt * self.triangle_loss
 
         self.total_loss += opts.tex_dt_loss_wt * self.tex_dt_loss
@@ -298,10 +315,10 @@ class ShapeTrainer(train_utils.Trainer):
         if opts.save_camera_pose_dict:
             cam_pred_multipose = self.cam_pred[:,None,:]
             quat_score = torch.ones_like(cam_pred_multipose[:,:,0])
-            self.update_camera_pose_dict(self.frame_id.squeeze(-1), cam_pred_multipose, quat_score, self.cams[:,:3], 
+            self.update_camera_pose_dict(self.frame_id.squeeze(-1), cam_pred_multipose, quat_score, self.cams[:,:3],
                 self.mask_iou[:,None], self.mask_iou_ms[:,None], self.mask_iou_gtcam[:,None], self.mask_iou_ms_gtcam[:,None],)
 
-    
+
     def update_camera_pose_dict(self, frameids, cams, scores, gt_st, maskious, maskious_ms, maskious_gtcam, maskious_ms_gtcam):
         ## Dictionary of all camera poses
         # dict[frameid] = (Px7: [scale trans quat], P:score, 3:gtscale gttrans)
@@ -333,7 +350,6 @@ class ShapeTrainer(train_utils.Trainer):
                 # print(gt_st[i,:].shape)
                 # print(maskious[i,:].shape)
                 # print('')
-                # import ipdb; ipdb.set_trace()
                 self.datasetCameraPoseDict[f] = (cams[i,:,:].cpu(), scores[i,:].cpu(), gt_st[i,:].cpu())
                 self.datasetMaskIouDict[f] = maskious[i,:].cpu()
                 self.datasetMaskIouMsDict[f] = maskious_ms[i,:].cpu()
@@ -348,10 +364,18 @@ class ShapeTrainer(train_utils.Trainer):
 
         if self.opts.texture:
             # B x 2 x H x W
-            uv_flows = self.model.texture_predictor.uvimage_pred
+            uv_flows = self.model.texture_predictor.uvimage_pred.detach()
             # B x H x W x 2
-            uv_flows = uv_flows.permute(0, 2, 3, 1)
-            uv_images = torch.nn.functional.grid_sample(self.imgs, uv_flows)
+            uv_flows = uv_flows.permute(0, 2, 3, 1).detach()
+            uv_images = torch.nn.functional.grid_sample(self.imgs, uv_flows).detach()
+            if self.opts.renderer == 'softras':
+                bb,f,t = uv_images.size(0),self.faces.shape[1], self.opts.tex_size
+                uv_sampler = self.model.uv_sampler_nmr.view(f,t*t,2)[None].expand(bb,-1,-1,-1)
+                textures_nmr = torch.nn.functional.grid_sample(uv_images, uv_sampler)
+                textures_nmr = textures_nmr.view(bb, -1, f, t, t).permute(0, 2, 3, 4, 1)
+                textures_nmr = textures_nmr.unsqueeze(4).repeat(1, 1, 1, 1, t, 1)
+            else:
+                textures_nmr = self.textures
 
         num_show = min(2, self.opts.batch_size)
         show_uv_imgs = []
@@ -362,7 +386,7 @@ class ShapeTrainer(train_utils.Trainer):
             pred_kp_img = bird_vis.kp2im(self.kp_pred[i].data, self.imgs[i].data)
             masks = bird_vis.tensor2mask(mask_concat[i].data)
             if self.opts.texture:
-                texture_here = self.textures[i]
+                texture_here = textures_nmr[i]
             else:
                 texture_here = None
 
@@ -418,6 +442,7 @@ class ShapeTrainer(train_utils.Trainer):
             ('total_loss', self.total_loss.item()),
             ('mask_loss', self.mask_loss.item()),
             ('deform_reg', self.deform_reg.item()),
+            ('template_deform_reg', self.template_deform_reg.item()),
             ('tri_loss', self.triangle_loss.item()),
         ])
         sc_dict['kp_loss'] = self.kp_loss.item()

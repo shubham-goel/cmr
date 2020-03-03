@@ -34,9 +34,18 @@ class MeshPredictor(object):
 
         self.symmetric = opts.symmetric
 
+        mean_shape_path = 'birds/csm_mesh/bird_mean_shape.npy'
+        mean_shape = np.load(mean_shape_path,allow_pickle=True,encoding='latin1').item()
+        verts_uv = mean_shape['verts_uv']
+        verts = mean_shape['verts']
+        faces = mean_shape['faces']
         img_size = (opts.img_size, opts.img_size)
         print('Setting up model..')
-        self.model = mesh_net.MeshNet(img_size, opts, nz_feat=opts.nz_feat)
+        self.model = mesh_net.MeshNet(
+            img_size, opts, verts, faces, verts_uv, nz_feat=opts.nz_feat)
+
+        # img_size = (opts.img_size, opts.img_size)
+        # self.model = mesh_net.MeshNet(img_size, opts, nz_feat=opts.nz_feat)
 
         self.load_network(self.model, 'pred', self.opts.num_train_epoch)
         self.model.eval()

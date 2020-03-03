@@ -25,6 +25,7 @@ from .utils import image as img_util
 
 flags.DEFINE_string('img_path', 'data/im1963.jpg', 'Image to run')
 flags.DEFINE_integer('img_size', 256, 'image size the network was trained on.')
+flags.DEFINE_enum('renderer', 'nmr', ['nmr','softras'], 'What renderer to use')
 
 opts = flags.FLAGS
 

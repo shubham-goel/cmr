@@ -255,8 +255,11 @@ def draw_kp(kp, img, radius=None):
         # This sometimes causes OverflowError,,
         if kpi[2] == 0:
             continue
-        cv2.circle(image, (kpi[0], kpi[1]), radius + 1, white, -1)
-        cv2.circle(image, (kpi[0], kpi[1]), radius, color, -1)
+        try:
+            cv2.circle(image, (kpi[0], kpi[1]), radius + 1, white, -1)
+            cv2.circle(image, (kpi[0], kpi[1]), radius, color, -1)
+        except:
+            pass
 
     # import matplotlib.pyplot as plt
     # plt.ion()
